@@ -33,9 +33,10 @@ example's file name replaces that example.
         "nds": "mine/ds.png",      gb, snes, nes, megadrive, n64, psx, pico-8, ports, ... (the folder names
         "gba": "mine/gba.png"      in roms/, and banana/systems.conf.default lists them all)
       },
-      "sounds": {                  the menu's sounds (WAV): scroll, select, back, fav, ready, insert; "off"
-        "scroll": "mine/tick.wav", for none (they change at the next start of the menu)
-        "fav": "off"
+      "sounds": {                  the menu's sounds (WAV): scroll, select, back, fav, ready, insert, and music
+        "scroll": "mine/tick.wav", (a track looped quietly under the menu while Background music is on); "off"
+        "fav": "off",              for none (the clicks change at the next start of the menu; "music" takes
+        "music": "mine/tune.wav"   effect at once). A WAV 16-bit PCM of any rate; it loops seamlessly.
       }
     }
 

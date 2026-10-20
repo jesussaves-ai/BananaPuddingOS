@@ -2,6 +2,7 @@
 #include "../rnds/RndsUI.h"
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #ifdef BANANA_ALSA
@@ -11,6 +12,12 @@
 
 namespace banana
 {
+	// everything is mixed at this rate, so the chimes (written at 44100) play back without touching a resampler; a
+	// music track at another rate is brought to it once, when it is loaded
+	static const int SFX_RATE = 44100;
+	// the music sits under the chimes (the one-shots keep their own level): about -7 dB, a bed, not the main event
+	static const int MUSIC_GAIN_Q = 115;	// 0.45 in 1/256ths
+
 	// 16-bit PCM WAV only (what rnds/gen_sounds.py writes)
 	static bool loadWav(const std::string& path, std::vector<int16_t>& pcm, int& rate, int& channels)
 	{
@@ -47,7 +54,32 @@ namespace banana
 		return false;
 	}
 
-	Sound::Sound(const std::string& dir)
+	// a music track at the mix rate, once, on the thread that loads it: linear interpolation is enough for a bed, and
+	// it keeps the worker's per-sample work to a lookup (the chimes never hit this path)
+	static void resampleTo(std::vector<int16_t>& pcm, int& rate, int channels, int to)
+	{
+		if (rate == to || channels < 1) return;
+		size_t total = pcm.size() / (size_t)channels;
+		if (!total) return;
+		size_t n = (size_t)std::llround((double)total * to / rate);
+		std::vector<int16_t> out(n * (size_t)channels);
+		for (size_t i = 0; i < n; i++)
+		{
+			double sp = (double)i * rate / to;
+			size_t s = (size_t)sp; if (s >= total) s = total - 1;
+			size_t s2 = std::min(s + 1, total - 1);
+			double f = sp - (double)s;
+			for (int ch = 0; ch < channels; ch++)
+			{
+				double a = pcm[s * channels + ch], b = pcm[s2 * channels + ch];
+				out[i * channels + ch] = (int16_t)std::lround(a + (b - a) * f);
+			}
+		}
+		pcm.swap(out);
+		rate = to;
+	}
+
+	Sound::Sound(const std::string& assetsSounds) : dir(assetsSounds)
 	{
 		for (const char* n : { "scroll", "select", "back", "fav", "ready", "insert" })
 		{
@@ -78,6 +110,39 @@ namespace banana
 		{
 			std::lock_guard<std::mutex> l(m);
 			queued = name;
+			paused = false;		// a game may have had the device; a sound means the menu is back
+		}
+		cv.notify_all();
+	}
+
+	void Sound::setMusicEnabled(bool on)
+	{
+		// a theme's own track first (that isn't "off"), else the one beside the sounds; a track that can't be read is
+		// no music, not an error the menu has to mind
+		std::string path;
+		if (on)
+		{
+			auto own = rnds::themeFiles.sounds.find("music");
+			if (own != rnds::themeFiles.sounds.end()) { if (own->second != "off") path = own->second; }
+			else path = dir + "/music.wav";
+		}
+		if (path == musicPath) return;		// the same track: let it play on (changing other settings mustn't restart it)
+		std::shared_ptr<const Clip> c;
+		if (!path.empty())
+		{
+			Clip tmp;
+			if (loadWav(path, tmp.pcm, tmp.rate, tmp.channels) && !tmp.pcm.empty())
+			{
+				resampleTo(tmp.pcm, tmp.rate, tmp.channels, SFX_RATE);
+				c = std::make_shared<const Clip>(std::move(tmp));
+			}
+			else fprintf(stderr, "banana-ui: music: %s can't be read (no background music)\n", path.c_str());
+		}
+		{
+			std::lock_guard<std::mutex> l(m);
+			musicPath = path;
+			music = c;
+			musicChanged = true;
 		}
 		cv.notify_all();
 	}
@@ -87,6 +152,7 @@ namespace banana
 		{
 			std::lock_guard<std::mutex> l(m);
 			closeNow = true;
+			paused = true;		// and don't reopen for the music until resume()
 			queued.clear();
 		}
 		cv.notify_all();
@@ -101,6 +167,15 @@ namespace banana
 		}
 	}
 
+	void Sound::resume()
+	{
+		{
+			std::lock_guard<std::mutex> l(m);
+			paused = false;
+		}
+		cv.notify_all();
+	}
+
 	void Sound::run()
 	{
 #ifdef BANANA_ALSA
@@ -109,11 +184,16 @@ namespace banana
 		// and the first try fails because the I2S clock isn't running yet; the next try is ~0.4 s later and finds no
 		// clock either if a short click has already ended, so an amplifier gave up for the whole time the device was
 		// open (one speaker, or none). A running stream lets the retry find its clock. Writing 10 ms at a time also
-		// lets a new sound cut the one playing (a held direction scrolls fast) within the 30 ms buffer.
+		// lets a new sound cut the one playing (a held direction scrolls fast) within the 30 ms buffer, and lets the
+		// music loop under it without either one holding the frames' thread.
 		const auto QUIET = std::chrono::seconds(20);
 		snd_pcm_t* pcm = nullptr;
 		int openRate = 0, openCh = 0;
-		std::vector<int16_t> silence;
+		std::vector<int16_t> mix;			// one 10 ms chunk: the music, then the chimes over it
+		std::shared_ptr<const Clip> mus;	// the loop playing now
+		double musPos = 0;
+		const Clip* cur = nullptr;			// the one-shot sound playing now
+		double curPos = 0;
 		auto closeDev = [&] { if (pcm) { snd_pcm_drop(pcm); snd_pcm_close(pcm); pcm = nullptr; } };
 		// Where sound plays (speakers or headphones) is bananad's /run/banana/asound.conf, which it replaces when the
 		// jack changes. alsa-lib reads its configuration once per process (a file it loaded through a hook, as
@@ -121,17 +201,47 @@ namespace banana
 		auto routeId = [] { struct stat st; return stat("/run/banana/asound.conf", &st) ? 0LL : (long long)st.st_ino * 1000003LL + st.st_mtim.tv_sec * 1000000000LL + st.st_mtim.tv_nsec; };
 		long long routeLoaded = routeId();
 		int routeCheck = 0;
-		const Clip* cur = nullptr;
-		size_t at = 0;			// cur's next frame
 		auto lastSound = std::chrono::steady_clock::now();
+
+		// mixes one clip into the chunk, at its own rate and channel count, advancing pos in its own frames; a loop
+		// wraps at the end (seamlessly: the track was written to), a one-shot just stops
+		auto mixClip = [&](const Clip& c, double& pos, bool loop, int gainQ)
+		{
+			const int ch = c.channels;
+			if (ch < 1) return;
+			size_t total = c.pcm.size() / (size_t)ch;
+			if (!total) return;
+			size_t frames = mix.size() / (size_t)openCh;
+			double step = (double)c.rate / openRate;
+			for (size_t i = 0; i < frames; i++)
+			{
+				if (pos >= (double)total)
+				{
+					if (!loop) { pos = (double)total; break; }
+					pos = std::fmod(pos, (double)total);
+				}
+				size_t s = (size_t)pos;
+				if (s >= total) s = total - 1;
+				const int16_t* fr = &c.pcm[s * (size_t)ch];
+				int l = fr[0], r = ch > 1 ? fr[1] : fr[0];
+				int16_t* d = &mix[i * (size_t)openCh];
+				int a = d[0] + l * gainQ / 256;
+				d[0] = (int16_t)(a < -32768 ? -32768 : a > 32767 ? 32767 : a);
+				if (openCh > 1) { int b = d[1] + r * gainQ / 256; d[1] = (int16_t)(b < -32768 ? -32768 : b > 32767 ? 32767 : b); }
+				pos += step;
+			}
+		};
+
 		for (;;)
 		{
 			std::string name;
 			{
 				std::unique_lock<std::mutex> l(m);
-				if (!pcm) cv.wait(l, [this] { return stop || closeNow || !queued.empty(); });	// closed: nothing to do
+				// closed: nothing to do until a sound, or the music (when not paused for a game)
+				if (!pcm) cv.wait(l, [this] { return stop || closeNow || (!paused && (!queued.empty() || music)); });
 				if (stop) break;
 				if (closeNow) { closeDev(); cur = nullptr; closeNow = false; continue; }	// a game is starting
+				if (musicChanged) { mus = music; musPos = 0; musicChanged = false; if (!mus) lastSound = std::chrono::steady_clock::now(); }
 				name = queued;
 				queued.clear();
 			}
@@ -139,36 +249,47 @@ namespace banana
 			if (!name.empty())
 			{
 				const Clip& c = clips[name];
-				if (pcm && (openRate != c.rate || openCh != c.channels)) closeDev();
-				if (!pcm)
-				{
-					if (long long r = routeId(); r != routeLoaded) { snd_config_update_free_global(); routeLoaded = r; }
-					if (snd_pcm_open(&pcm, "default", SND_PCM_STREAM_PLAYBACK, 0) < 0) { pcm = nullptr; continue; }
-					if (snd_pcm_set_params(pcm, SND_PCM_FORMAT_S16_LE, SND_PCM_ACCESS_RW_INTERLEAVED, c.channels, c.rate, 1, 30000) < 0)
-					{
-						snd_pcm_close(pcm); pcm = nullptr; continue;
-					}
-					openRate = c.rate; openCh = c.channels;
-					silence.assign((size_t)(openRate / 100) * openCh, 0);
-				}
 				cur = &c;
-				at = 0;
+				curPos = 0;
 				lastSound = now;
 			}
-			else if (!cur && now - lastSound >= QUIET) { closeDev(); continue; }
-			// the jack changed while the stream runs (every 250 ms): the next sound opens where sound plays now
-			if (++routeCheck >= 25) { routeCheck = 0; if (routeId() != routeLoaded) { closeDev(); cur = nullptr; continue; } }
-			// the next 10 ms: the sound's, or silence
-			const int16_t* p = silence.data();
-			snd_pcm_sframes_t frames = (snd_pcm_sframes_t)(silence.size() / openCh);
-			if (cur)
+			const Clip* fmt = mus ? mus.get() : cur;
+			if (fmt && (!pcm || openRate != fmt->rate || openCh != fmt->channels))
 			{
-				size_t total = cur->pcm.size() / openCh;
-				frames = (snd_pcm_sframes_t)std::min<size_t>((size_t)frames, total - at);
-				p = cur->pcm.data() + at * openCh;
-				at += (size_t)frames;
-				if (at >= total) { cur = nullptr; lastSound = now; }
+				if (pcm) closeDev();
+				if (long long r = routeId(); r != routeLoaded) { snd_config_update_free_global(); routeLoaded = r; }
+				if (snd_pcm_open(&pcm, "default", SND_PCM_STREAM_PLAYBACK, 0) < 0) { pcm = nullptr; std::this_thread::sleep_for(std::chrono::milliseconds(200)); continue; }
+				if (snd_pcm_set_params(pcm, SND_PCM_FORMAT_S16_LE, SND_PCM_ACCESS_RW_INTERLEAVED, fmt->channels, fmt->rate, 1, 30000) < 0)
+				{
+					snd_pcm_close(pcm); pcm = nullptr;
+					std::this_thread::sleep_for(std::chrono::milliseconds(200));
+					continue;
+				}
+				openRate = fmt->rate; openCh = fmt->channels;
+				mix.assign((size_t)(openRate / 100) * (size_t)openCh, 0);
 			}
+			if (!pcm) continue;
+			// nothing playing: hold the stream open (the amplifiers) with silence until QUIET has passed
+			if (!cur && !mus)
+			{
+				if (now - lastSound >= QUIET) { closeDev(); continue; }
+				std::fill(mix.begin(), mix.end(), 0);
+			}
+			else
+			{
+				std::fill(mix.begin(), mix.end(), 0);
+				if (mus) mixClip(*mus, musPos, true, MUSIC_GAIN_Q);
+				if (cur)
+				{
+					size_t total = cur->pcm.size() / (size_t)cur->channels;
+					mixClip(*cur, curPos, false, 256);
+					if (!total || curPos >= (double)total) { cur = nullptr; lastSound = std::chrono::steady_clock::now(); }
+				}
+			}
+			// the jack changed while the stream runs (every 250 ms): the next sound opens where sound plays now
+			if (++routeCheck >= 25) { routeCheck = 0; if (routeId() != routeLoaded) { closeDev(); cur = nullptr; musPos = 0; continue; } }
+			const int16_t* p = mix.data();
+			snd_pcm_sframes_t frames = (snd_pcm_sframes_t)(mix.size() / (size_t)openCh);
 			while (frames > 0)
 			{
 				snd_pcm_sframes_t w = snd_pcm_writei(pcm, p, (snd_pcm_uframes_t)frames);	// blocks while the buffer is full
@@ -181,9 +302,10 @@ namespace banana
 		std::unique_lock<std::mutex> l(m);
 		for (;;)
 		{
-			cv.wait(l, [this] { return stop || closeNow || !queued.empty(); });
+			cv.wait(l, [this] { return stop || closeNow || (!paused && (!queued.empty() || music)); });
 			if (stop) break;
 			closeNow = false;
+			if (musicChanged) musicChanged = false;
 			queued.clear();
 		}
 #endif

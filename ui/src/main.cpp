@@ -24,6 +24,7 @@
 #include "sound.h"
 #include "menu.h"
 #include "carts.h"
+#include "quickmenu.h"
 
 #include <algorithm>
 #include <atomic>
@@ -458,6 +459,7 @@ static int runHeadless(const Options& o, Host& lib, const std::string& variant, 
 	std::unique_ptr<Menu> uiPtr(theme == "carts" ? (Menu*)new CartMenu(&lib, &be, o.banana + "/fonts", o.h / 480.0f)
 		: new RndsMenu(&lib, &be, o.assets, o.h / 480.0f, variant));
 	Menu& ui = *uiPtr;
+	QuickMenu quick(o.assets + "/fonts", o.w, o.h, o.h / 480.0f, variant == "light", theme == "carts");
 	double now = 100000;
 	std::stringstream ss(o.script);
 	std::string cmd;
@@ -474,16 +476,33 @@ static int runHeadless(const Options& o, Host& lib, const std::string& variant, 
 	settings.setSync(true);
 	settings.searchCount = [&](const std::string& q) { return lib.countMatches(q); };
 	LowBattery low;
-	be.overlay = [&](int screen) { if (screen == 0 && low.showing(now)) settings.notice(low.title, low.body, low.percent); };
+	auto quickAct = [&](QuickMenu::Action a)
+	{
+		if (a == QuickMenu::HOME) ui.setHome(ui.systemIndex());
+		else if (a == QuickMenu::GAMES) { int s = ui.systemIndex(); int g = lib.openLibrary(s); ui.setLibrary(s, g >= 0 ? g : 0); }
+		else if (a == QuickMenu::SEARCH) settings.openSearch(lib.searchQuery());
+		else if (a == QuickMenu::SETTINGS) settings.open();
+		logf("quick: %d", (int)a);
+	};
+	be.overlay = [&](int screen)
+	{
+		quick.draw(be, screen, now);
+		if (screen == 0 && low.showing(now)) settings.notice(low.title, low.body, low.percent);
+	};
 	while (std::getline(ss, cmd, ';'))
 	{
 		std::stringstream cs(cmd);
 		std::string op;
 		cs >> op;
 		ui.update(now);
+		quick.setEnabled(!settings.isOpen() && ui.view() != rnds::UI::LAUNCH);
+		quick.setCanGames(lib.systemCount() > 0);
+		quick.update(now);
 		if (op == "home") { int s = 0; cs >> s; ui.setHome(s); }
 		else if (op == "lib") { int s = 0, g = 0; cs >> s >> g; lib.openLibrary(s); ui.setLibrary(s, g); }
 		else if (op == "wait") { double ms = 0; cs >> ms; now += ms; }
+		else if (op == "quick") { std::string a; cs >> a; if (a == "close") quick.close(now); else quick.open(now); quick.update(now); logf("quick %s", a.empty() ? "open" : a.c_str()); }
+		else if (op == "qmode") { std::string m; cs >> m; quick.setMode(m == "game" ? QuickMenu::GAME : QuickMenu::MENU); logf("quick mode %s", m.c_str()); }
 		else if (op == "battery")
 		{
 			// battery <percent> [charging]: what /sys would say from now on
@@ -563,22 +582,31 @@ static int runHeadless(const Options& o, Host& lib, const std::string& variant, 
 			// touch <screen> <x> <y>: a tap, in px of a 640x480 panel
 			int scr = 1; float x = 0, y = 0;
 			cs >> scr >> x >> y;
-			float k = o.h / 480.0f;
-			if (settings.isOpen() && scr == 1)
+			float k = o.h / 480.0f, px = x * k, py = y * k;
+			QuickMenu::Action qa = QuickMenu::NONE;
+			if (quick.touch(scr, px, py, true, now, qa))
 			{
-				settings.touch(x * k, y * k, true);
-				logf("touch %.0f %.0f: settings result %d", x, y, (int)settings.touch(x * k, y * k, false));
+				QuickMenu::Action chosen = QuickMenu::NONE;
+				quick.touch(scr, px, py, false, now, chosen);
+				if (chosen != QuickMenu::NONE) quickAct(chosen);
+				logf("touch %.0f %.0f: quick %d", x, y, (int)chosen);
+			}
+			else if (settings.isOpen() && scr == 1)
+			{
+				settings.touch(px, py, true);
+				logf("touch %.0f %.0f: settings result %d", x, y, (int)settings.touch(px, py, false));
 			}
 			else
 			{
-				ui.touch(scr, x * k, y * k, true);
-				logf("touch %.0f %.0f: %s", x, y, ui.touch(scr, x * k, y * k, false) ? "used" : "unused");
+				ui.touch(scr, px, py, true);
+				logf("touch %.0f %.0f: %s", x, y, ui.touch(scr, px, py, false) ? "used" : "unused");
 			}
 		}
 		else if (op == "shot")
 		{
 			std::string name; cs >> name;
 			double t0 = 0, t1 = 0;
+			for (int i = 0; i < 24 && quick.animating(); i++) { now += 16; quick.update(now); }	// the slide at rest
 			if (settings.isOpen())
 			{
 				settings.update(now);	// what came back since the last command (a press skips the update below)
@@ -971,6 +999,7 @@ int main(int argc, char** argv)
 	worker.start(uiPtr);
 	irisToMenu(disp, be, *ui);
 	bootMark("banana-ui: the menu");
+	sound.setMusicEnabled(settings["music"] != "off");	// the music starts with the menu, not over the boot animation
 	// the first boot after the installation: the setup (Wi-Fi, the time zone, the accounts) before anything else
 	bool firstSetup = access((o.data + "/setup-done").c_str(), F_OK) != 0;
 
@@ -986,6 +1015,10 @@ int main(int argc, char** argv)
 	settingsView.setFontDir(o.banana + "/fonts");
 	settingsView.searchCount = [&](const std::string& q) { return lib.countMatches(q); };
 	settingsView.setVariant(settings["theme"]);	// (Carts: Inter)
+	// the bottom panel's quick menu: the menu's actions by touch, or (while a game runs) RetroArch's
+	QuickMenu quick(settings["theme"] == "carts" ? o.banana + "/fonts" : o.assets + "/fonts",
+		disp.width(), disp.height(), scale, variant == "light", settings["theme"] == "carts");
+	quick.setEnabled(false);	// the loop below enables it once Settings isn't in the way
 	LowBattery low;
 	bool batteryDue = true;
 	if (firstSetup) { settingsView.setup(); logf("first-time setup"); }
@@ -997,8 +1030,9 @@ int main(int argc, char** argv)
 	double osdUntil = 0;
 	be.overlay = [&](int screen)
 	{
-		if (screen != 0) return;
 		double t = nowMs();
+		quick.draw(be, screen, t);	// part of the screen's draw list: damage-tracked like the menu's own draws
+		if (screen != 0) return;
 		if (low.showing(t)) settingsView.notice(low.title, low.body, low.percent);
 		else if (osdUntil > t) settingsView.level(osdLabel, osdPercent);
 		else settingsView.drawToast(t);	// (only while Settings is open: the account check's result)
@@ -1017,6 +1051,7 @@ int main(int argc, char** argv)
 			lib.twelveHour = settings["clock"] == "12h";
 			lib.batteryShown = settings["battery"] == "percent" ? "text" : "icon";
 			sound.enabled = settings["sounds"] != "off";
+			sound.setMusicEnabled(settings["music"] != "off");
 			ui->dataChanged();
 			sound.play("select");
 			break;
@@ -1027,6 +1062,8 @@ int main(int argc, char** argv)
 			settings = readSettings(o.data + "/settings.conf");
 			variant = applyTheme(settings["theme"], settings["accent"]);
 			if (variant == "carts") variant = "dark";
+			// the theme may bring its own track (or leave the default): pick it up now
+			sound.setMusicEnabled(settings["music"] != "off");
 			int sys = ui->systemIndex();
 			uiPtr.reset(makeMenu(settings["theme"], scale));
 			ui = uiPtr.get();
@@ -1056,10 +1093,68 @@ int main(int argc, char** argv)
 		dirty = true;
 	};
 
+	// a tile of the quick menu: the menu's own actions (the buttons' equivalents), under the same lock the worker uses
+	auto quickAction = [&](QuickMenu::Action a)
+	{
+		if (a == QuickMenu::NONE) return;
+		{
+			std::lock_guard<std::mutex> l(worker.uiLock);
+			if (ui->view() == rnds::UI::LAUNCH) return;	// the cartridge is going in: nothing to leave for yet
+			if (a == QuickMenu::HOME)
+			{
+				int s = ui->systemIndex();
+				ui->touchCancel();
+				ui->setHome(s >= 0 && s < lib.systemCount() ? s : 0);
+				rep.key = Key::NONE;
+				sound.play("back");
+			}
+			else if (a == QuickMenu::GAMES)
+			{
+				int s = ui->systemIndex();
+				if (s >= 0 && s < lib.systemCount() && ui->view() != rnds::UI::LAUNCH)
+				{
+					int g = lib.openLibrary(s);
+					ui->touchCancel();
+					ui->setLibrary(s, g >= 0 ? g : 0);
+					rep.key = Key::NONE;
+					sound.play("select");
+				}
+			}
+			else if (a == QuickMenu::SEARCH || a == QuickMenu::SETTINGS)
+			{
+				if (ui->view() == rnds::UI::LAUNCH) return;
+				ui->touchCancel();
+				settingsView.setVariant(settings["theme"]);
+				if (a == QuickMenu::SEARCH) settingsView.openSearch(lib.searchQuery());
+				else settingsView.open();
+				rep.key = Key::NONE;
+				sound.play("select");
+				quick.setEnabled(false);	// Settings owns both panels now
+			}
+		}
+		dirty = true;
+	};
+
 	auto handle = [&](const InputEvent& ev)
 	{
 		if (ev.type == InputEvent::PRESS || ev.type == InputEvent::TOUCH_DOWN) boost.frame(nowMs());	// what it starts drawn fast
 		if ((ev.type == InputEvent::PRESS || ev.type == InputEvent::TOUCH_DOWN) && low.hide(nowMs())) dirty = true;
+		// the quick menu takes the touches it draws over, first: the menu under it never sees them
+		if (ev.type == InputEvent::TOUCH_MOVE)
+		{
+			if (quick.touchMove(ev.screen, ev.x, ev.y)) { dirty = true; return; }
+		}
+		else if (ev.type == InputEvent::TOUCH_DOWN || ev.type == InputEvent::TOUCH_UP)
+		{
+			QuickMenu::Action a = QuickMenu::NONE;
+			if (quick.touch(ev.screen, ev.x, ev.y, ev.type == InputEvent::TOUCH_DOWN, nowMs(), a))
+			{
+				if (a != QuickMenu::NONE) quickAction(a);
+				dirty = true;
+				return;
+			}
+		}
+		if (ev.type == InputEvent::PRESS && quick.isOpen()) { quick.close(nowMs()); dirty = true; }
 		if (settingsView.isOpen())
 		{
 			std::lock_guard<std::mutex> l(worker.uiLock);
@@ -1150,6 +1245,11 @@ int main(int argc, char** argv)
 			std::lock_guard<std::mutex> l(worker.uiLock);
 			settingsView.gameOpen(title, sysName, panelScreen, input.hasTouch(panelScreen));
 		}
+		// the quick menu over the game panel: save, load, RetroArch's menu, fast forward, and the way out
+		quick.setMode(QuickMenu::GAME);
+		quick.setScreen(panelScreen);
+		quick.setEnabled(input.hasTouch(panelScreen));
+		quick.closeNow();
 		be.invalidate();
 		bool want = true;
 		for (;;)
@@ -1157,6 +1257,7 @@ int main(int argc, char** argv)
 			pid_t w = waitpid(pid, &status, WNOHANG);
 			if (w == pid || (w < 0 && errno != EINTR)) break;
 			double t = nowMs();
+			if (quick.update(t)) want = true;
 			{
 				std::lock_guard<std::mutex> l(worker.uiLock);
 				if (settingsView.gameUpdate(t)) want = true;
@@ -1171,12 +1272,33 @@ int main(int argc, char** argv)
 			}
 			std::vector<pollfd> fds = { { disp.pollFd(), POLLIN, 0 } };
 			for (int fd : input.fds()) fds.push_back({ fd, POLLIN, 0 });
-			if (poll(fds.data(), fds.size(), 100) <= 0) continue;
+			if (poll(fds.data(), fds.size(), quick.animating() ? 16 : 100) <= 0) continue;
 			if (fds[0].revents & POLLIN) disp.handleEvents();
 			for (size_t i = 1; i < fds.size(); i++)
 				if (fds[i].revents & POLLIN)
 					input.read(fds[i].fd, [&](const InputEvent& ev)
 					{
+						// the quick menu's touches, before the panel's own tiles
+						QuickMenu::Action qa = QuickMenu::NONE;
+						if (ev.type == InputEvent::TOUCH_MOVE)
+						{
+							if (quick.touchMove(ev.screen, ev.x, ev.y)) want = true;
+							return;
+						}
+						if ((ev.type == InputEvent::TOUCH_DOWN || ev.type == InputEvent::TOUCH_UP) &&
+							quick.touch(ev.screen, ev.x, ev.y, ev.type == InputEvent::TOUCH_DOWN, nowMs(), qa))
+						{
+							want = true;
+							const char* qc = qa == QuickMenu::SAVE_STATE ? "SAVE_STATE\n" : qa == QuickMenu::LOAD_STATE ? "LOAD_STATE\n" :
+								qa == QuickMenu::RETROARCH_MENU ? "MENU_TOGGLE\n" : qa == QuickMenu::FAST_FORWARD ? "FAST_FORWARD\n" :
+								qa == QuickMenu::QUIT_GAME ? "QUIT\n" : nullptr;
+							if (qc)
+							{
+								logf("game panel: %.*s", (int)strlen(qc) - 1, qc);
+								if (write(cmdFd, qc, strlen(qc)) < 0) {}
+							}
+							return;
+						}
 						if (ev.screen != panelScreen) return;	// buttons are the game's; touch only on the panel
 						if (ev.type != InputEvent::TOUCH_DOWN && ev.type != InputEvent::TOUCH_UP) return;
 						Settings::GameAction a;
@@ -1194,6 +1316,10 @@ int main(int argc, char** argv)
 						}
 					});
 		}
+		quick.setMode(QuickMenu::MENU);
+		quick.setScreen(1);
+		quick.setEnabled(false);	// the menu loop enables it again if it may show
+		quick.closeNow();
 	};
 
 	auto runGame = [&](int game)
@@ -1296,6 +1422,7 @@ int main(int argc, char** argv)
 		logf("game ended after %ld s (status %d)", secs, status);
 		for (int tries = 0; !disp.open(o.top, err) && tries < 100; tries++) usleep(50000);
 		be.invalidate();
+		sound.resume();		// the menu has the sound device back: the background music carries on
 		input.open(o.touch, disp.width(), disp.height());
 		std::lock_guard<std::mutex> l(worker.uiLock);
 		{
@@ -1323,6 +1450,13 @@ int main(int argc, char** argv)
 	while (!quit)
 	{
 		double now = nowMs();
+		// the quick menu is for the menu's own screens: not over Settings, not during a launch
+		{
+			std::lock_guard<std::mutex> l(worker.uiLock);
+			quick.setEnabled(!settingsView.isOpen() && ui->view() != rnds::UI::LAUNCH);
+		}
+		quick.setCanGames(lib.systemCount() > 0);
+		if (quick.update(now)) dirty = true;	// the slide's next step
 		{
 			std::lock_guard<std::mutex> l(worker.uiLock);
 			ui->update(now);
@@ -1397,7 +1531,8 @@ int main(int argc, char** argv)
 		bool want;
 		{
 			std::lock_guard<std::mutex> l(worker.uiLock);
-			want = dirty || (settingsView.isOpen() ? settingsView.animating() : (ui->animating() || ui->nextWake() == 0));
+			want = dirty || quick.animating() ||
+				(settingsView.isOpen() ? settingsView.animating() : (ui->animating() || ui->nextWake() == 0));
 		}
 		// the next frame is drawn while the last one's flips are still pending (present copies it out, so the canvas is
 		// free again at once), and handed over when both panels have flipped: drawing (~10 ms on the RG DS) and the wait
@@ -1434,6 +1569,10 @@ int main(int argc, char** argv)
 		{
 			std::lock_guard<std::mutex> l(worker.uiLock);
 			timeout = want || drawn ? -1 : (settingsView.isOpen() ? settingsView.nextWake(now) : ui->nextWake());	// a frame is wanted: the flip event wakes us
+		}
+		{
+			int qw = quick.nextWake(now);	// (a slide that is settling)
+			if (qw >= 0 && (timeout < 0 || qw < timeout)) timeout = qw;
 		}
 		if (want && !drawn && !disp.flipPending())	// ...unless no flip is pending: then the end of the quiet refresh
 			timeout = std::max(1, (int)(quietUntil - nowMs() + 0.999));
